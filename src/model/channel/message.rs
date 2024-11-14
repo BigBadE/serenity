@@ -106,15 +106,11 @@ pub struct Message {
     pub flags: Option<MessageFlags>,
     /// The message that was replied to using this message.
     pub referenced_message: Option<Box<Message>>, // Boxed to avoid recursion
-    #[cfg_attr(
-        all(not(ignore_serenity_deprecated), feature = "unstable_discord_api"),
-        deprecated = "Use interaction_metadata"
-    )]
+    #[cfg_attr(not(ignore_serenity_deprecated), deprecated = "Use interaction_metadata")]
     pub interaction: Option<Box<MessageInteraction>>,
     /// Sent if the message is a response to an [`Interaction`].
     ///
     /// [`Interaction`]: crate::model::application::Interaction
-    #[cfg(feature = "unstable_discord_api")]
     pub interaction_metadata: Option<Box<MessageInteractionMetadata>>,
     /// The thread that was started from this message, includes thread member object.
     pub thread: Option<GuildChannel>,
@@ -218,6 +214,26 @@ impl Message {
     #[deprecated = "Check Message::author is equal to Cache::current_user"]
     pub fn is_own(&self, cache: impl AsRef<Cache>) -> bool {
         self.author.id == cache.as_ref().current_user().id
+    }
+
+    /// Calculates the permissions of the message author in the current channel.
+    ///
+    /// This may return `None` if:
+    /// - The [`Cache`] does not have the current [`Guild`]
+    /// - This message is not from [`MessageCreateEvent`] and the author's [`Member`] cannot be
+    ///   found in [`Guild#structfield.members`].
+    #[cfg(feature = "cache")]
+    pub fn author_permissions(&self, cache: impl AsRef<Cache>) -> Option<Permissions> {
+        let Some(guild_id) = self.guild_id else {
+            return Some(Permissions::dm_permissions());
+        };
+
+        let guild = cache.as_ref().guild(guild_id)?;
+        if let Some(member) = &self.member {
+            Some(guild.partial_member_permissions(self.author.id, member))
+        } else {
+            Some(guild.member_permissions(guild.members.get(&self.author.id)?))
+        }
     }
 
     /// Deletes the message.
@@ -1086,6 +1102,22 @@ pub struct MessageActivity {
     pub party_id: Option<String>,
 }
 
+enum_number! {
+    /// Message Reference Type information
+    ///
+    /// [Discord docs](https://discord.com/developers/docs/resources/message#message-reference-types)
+    #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
+    #[cfg_attr(feature = "typesize", derive(typesize::derive::TypeSize))]
+    #[serde(from = "u8", into = "u8")]
+    #[non_exhaustive]
+    pub enum MessageReferenceKind {
+        #[default]
+        Default = 0,
+        Forward = 1,
+        _ => Unknown(u8),
+    }
+}
+
 /// Reference data sent with crossposted messages.
 ///
 /// [Discord docs](https://discord.com/developers/docs/resources/channel#message-reference-object-message-reference-structure).
@@ -1093,6 +1125,9 @@ pub struct MessageActivity {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[non_exhaustive]
 pub struct MessageReference {
+    /// The Type of Message Reference
+    #[serde(rename = "type", default = "MessageReferenceKind::default")]
+    pub kind: MessageReferenceKind,
     /// ID of the originating message.
     pub message_id: Option<MessageId>,
     /// ID of the originating message's channel.
@@ -1104,9 +1139,41 @@ pub struct MessageReference {
     pub fail_if_not_exists: Option<bool>,
 }
 
+impl MessageReference {
+    #[must_use]
+    pub fn new(kind: MessageReferenceKind, channel_id: ChannelId) -> Self {
+        Self {
+            kind,
+            channel_id,
+            message_id: None,
+            guild_id: None,
+            fail_if_not_exists: None,
+        }
+    }
+
+    #[must_use]
+    pub fn message_id(mut self, message_id: MessageId) -> Self {
+        self.message_id = Some(message_id);
+        self
+    }
+
+    #[must_use]
+    pub fn guild_id(mut self, guild_id: GuildId) -> Self {
+        self.guild_id = Some(guild_id);
+        self
+    }
+
+    #[must_use]
+    pub fn fail_if_not_exists(mut self, fail_if_not_exists: bool) -> Self {
+        self.fail_if_not_exists = Some(fail_if_not_exists);
+        self
+    }
+}
+
 impl From<&Message> for MessageReference {
     fn from(m: &Message) -> Self {
         Self {
+            kind: MessageReferenceKind::default(),
             message_id: Some(m.id),
             channel_id: m.channel_id,
             guild_id: m.guild_id,
@@ -1116,8 +1183,10 @@ impl From<&Message> for MessageReference {
 }
 
 impl From<(ChannelId, MessageId)> for MessageReference {
+    // TODO(next): Remove this
     fn from(pair: (ChannelId, MessageId)) -> Self {
         Self {
+            kind: MessageReferenceKind::default(),
             message_id: Some(pair.1),
             channel_id: pair.0,
             guild_id: None,
